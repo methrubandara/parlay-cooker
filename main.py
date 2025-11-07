@@ -4,7 +4,7 @@ from typing import List, Optional, Dict, Any
 import time
 
 # --------- MODE: start with STUB=True; later set to False to go live ---------
-STUB = True  # flip to False after Step 4 (live odds)
+STUB = False
 
 class Projection(BaseModel):
     mean: float
