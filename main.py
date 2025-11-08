@@ -20,11 +20,9 @@ def health():
 
 # --- 1) RAW: show SGO events payload exactly as returned ---
 @app.get("/sgo/events/raw")
-def sgo_events_raw(
-    date: str | None = Query(None, description="YYYY-MM-DD (if supported)"),
-    league: str = "nfl",
-    bookmakers: str = "draftkings,fanduel",
-):
+def sgo_events_raw(date: str | None = Query(None),
+league: str = "NFL",          # <- default ID
+bookmakers: str = "draftkings,fanduel"):
     """
     Pure proxy to SGO 'events' endpoint. Adjust path/params if your docs differ.
     """
@@ -34,12 +32,11 @@ def sgo_events_raw(
         f"{BASE_URL}/events",
     ]
     params = {
-        # These names are common across odds providers; tweak to your SGO docs if needed:
-        "league": league,              # some APIs use 'sport'
-        "bookmakers": bookmakers,      # some APIs use 'books'
-        "oddsAvailable": "true",       # many APIs gate events that actually have odds
-        "includeOdds": "true",         # ask to include odds inside the event payload
-        "includeAltLines": "true",     # if supported by plan
+        "leagueID": league,             # <- key change
+        "bookmakers": bookmakers,
+        "oddsAvailable": "true",
+        "includeOdds": "true",
+        "includeAltLines": "true",
     }
     if date:
         params["date"] = date
@@ -94,13 +91,11 @@ def norm_american(price) -> int | None:
         return None
 
 @app.get("/nfl/props")
-def nfl_props(
-    date: str | None = Query(None),
-    books: str = Query("draftkings,fanduel"),
-    league: str = Query("nfl")
-):
-    # 1) fetch events with odds included
-    raw = sgo_events_raw(date=date, league=league, bookmakers=books)
+raw = sgo_events_raw(date=date, league=league, bookmakers=books)
+# and change the default to ID-style too:
+def nfl_props(date: str | None = Query(None),
+              books: str = Query("draftkings,fanduel"),
+              league: str = Query("NFL")):   # <- default ID
 
     # 2) normalize event list
     events = []
