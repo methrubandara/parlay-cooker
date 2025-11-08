@@ -1,0 +1,110 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ParlayLab Props</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    select, button { padding: 8px; margin-right: 8px; }
+    table { border-collapse: collapse; margin-top: 16px; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; font-size: 14px; }
+    th { background: #f6f6f6; text-align: left; }
+    .muted { color: #666; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>ParlayLab – NFL Player Props (DraftKings)</h1>
+
+  <div>
+    <label for="eventSelect">Game:</label>
+    <select id="eventSelect"></select>
+    <button id="loadPropsBtn">Load Props</button>
+    <span id="status" class="muted"></span>
+  </div>
+
+  <table id="propsTable" style="display:none">
+    <thead>
+      <tr>
+        <th>Player</th>
+        <th>Market</th>
+        <th>Line</th>
+        <th>Over/Under</th>
+        <th>Odds (American)</th>
+        <th>Book</th>
+        <th>Game</th>
+      </tr>
+    </thead>
+    <tbody id="propsBody"></tbody>
+  </table>
+
+  <script>
+    const API_BASE = "https://parlay-cooker.onrender.com";
+
+    const eventSelect = document.getElementById("eventSelect");
+    const statusEl = document.getElementById("status");
+    const loadPropsBtn = document.getElementById("loadPropsBtn");
+    const propsTable = document.getElementById("propsTable");
+    const propsBody = document.getElementById("propsBody");
+
+    async function fetchJSON(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    }
+
+    async function loadEvents() {
+      statusEl.textContent = "Loading games…";
+      try {
+        const data = await fetchJSON(`${API_BASE}/events`);
+        (data.events || []).forEach(ev => {
+          const opt = document.createElement("option");
+          opt.value = ev.id;
+          opt.textContent = ev.matchup;
+          eventSelect.appendChild(opt);
+        });
+        statusEl.textContent = `Loaded ${data.count || 0} games`;
+      } catch (e) {
+        statusEl.textContent = `Failed to load games: ${e.message}`;
+      }
+    }
+
+    async function loadProps() {
+      const id = eventSelect.value;
+      if (!id) return;
+
+      statusEl.textContent = "Loading props…";
+      propsTable.style.display = "none";
+      propsBody.innerHTML = "";
+
+      try {
+        const data = await fetchJSON(`${API_BASE}/props?event_id=${encodeURIComponent(id)}`);
+        const rows = data.props || [];
+        if (!rows.length) {
+          statusEl.textContent = "No props found for this game (try another or later).";
+          return;
+        }
+        rows.forEach(p => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${p.player ?? ""}</td>
+            <td>${p.market ?? ""}</td>
+            <td>${p.line ?? ""}</td>
+            <td>${p.direction ?? ""}</td>
+            <td>${p.odds ?? ""}</td>
+            <td>${p.book ?? ""}</td>
+            <td>${p.game ?? ""}</td>
+          `;
+          propsBody.appendChild(tr);
+        });
+        propsTable.style.display = "";
+        statusEl.textContent = `Loaded ${rows.length} props`;
+      } catch (e) {
+        statusEl.textContent = `Failed to load props: ${e.message}`;
+      }
+    }
+
+    loadPropsBtn.addEventListener("click", loadProps);
+    loadEvents();
+  </script>
+</body>
+</html>
