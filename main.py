@@ -1,114 +1,174 @@
-from fastapi import FastAPI, HTTPException
-import requests
-import os
+from fastapi import FastAPI, HTTPException, Query
+import os, requests
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Load environment variables from .env (local dev)
 load_dotenv()
-
 app = FastAPI()
 
-# Read the API key from Render env or .env
 SGO_API_KEY = os.getenv("SGO_API_KEY")
-BASE_URL = "https://api.sportsgameodds.com"
+BASE_URL = os.getenv("SGO_BASE_URL", "https://api.sportsgameodds.com").rstrip("/")
 
-@app.get("/health")
-def health():
-    """Simple health check."""
-    return {
-        "ok": True,
-        "provider": "SportsGameOdds",
-        "time": datetime.utcnow().isoformat()
-    }
-
-
-# Helper: add API key header
 def sgo_headers():
     if not SGO_API_KEY:
         raise HTTPException(500, "Missing SGO_API_KEY")
-    # SportsGameOdds uses x-api-key for auth
     return {"x-api-key": SGO_API_KEY}
 
+@app.get("/health")
+def health():
+    return {"ok": True, "provider": "SportsGameOdds", "time": datetime.utcnow().isoformat()}
 
-# Common SGO endpoints that could serve player props
-CANDIDATE_PATHS = [
-    "/v2/odds/player-props",
-    "/v2/player-props",
-    "/v2/odds",
-    "/v1/odds/player-props",
-    "/v1/player-props",
-    "/v1/odds",
-    "/odds/player-props",
-    "/odds",
-]
-
-
-def build_param_variants(date, books):
-    """Generate parameter variants across known naming conventions."""
-    base_variants = [
-        {"league": "nfl", "bookmakers": books, "includeAltLines": "true"},
-        {"sport": "nfl",  "bookmakers": books, "includeAltLines": "true"},
-        {"league": "nfl", "books": books,      "includeAltLines": "true"},
-        {"sport": "nfl",  "books": books,      "includeAltLines": "true"},
+# --- 1) RAW: show SGO events payload exactly as returned ---
+@app.get("/sgo/events/raw")
+def sgo_events_raw(
+    date: str | None = Query(None, description="YYYY-MM-DD (if supported)"),
+    league: str = "nfl",
+    bookmakers: str = "draftkings,fanduel",
+):
+    """
+    Pure proxy to SGO 'events' endpoint. Adjust path/params if your docs differ.
+    """
+    url_candidates = [
+        f"{BASE_URL}/v2/events",
+        f"{BASE_URL}/v1/events",
+        f"{BASE_URL}/events",
     ]
-    for v in base_variants:
-        if date:
-            v["date"] = date
-    # Some endpoints need explicit market field
-    with_market = []
-    for v in base_variants:
-        vv = v.copy()
-        vv["market"] = "player_props"
-        with_market.append(vv)
-    return base_variants + with_market
+    params = {
+        # These names are common across odds providers; tweak to your SGO docs if needed:
+        "league": league,              # some APIs use 'sport'
+        "bookmakers": bookmakers,      # some APIs use 'books'
+        "oddsAvailable": "true",       # many APIs gate events that actually have odds
+        "includeOdds": "true",         # ask to include odds inside the event payload
+        "includeAltLines": "true",     # if supported by plan
+    }
+    if date:
+        params["date"] = date
 
-
-@app.get("/nfl/props")
-def get_props(date: str | None = None, books: str = "draftkings,fanduel"):
-    """
-    Attempt multiple SGO API paths and parameter variants to find player prop odds.
-    Returns first working combination and small sample of data.
-    """
     headers = sgo_headers()
     errors = []
+    for url in url_candidates:
+        r = requests.get(url, headers=headers, params=params, timeout=25)
+        if r.status_code == 200:
+            return r.json()
+        errors.append({"url": url, "status": r.status_code, "body": r.text[:300]})
 
-    for path in CANDIDATE_PATHS:
-        url = f"{BASE_URL.rstrip('/')}{path}"
-        for params in build_param_variants(date, books):
+    raise HTTPException(502, detail={"message": "SGO events endpoint not found",
+                                     "attempts": errors})
+
+# --- 2) NORMALIZED: extract player props from events ---
+def is_player_prop_market(mkey: str) -> bool:
+    if not mkey:
+        return False
+    m = mkey.lower()
+    # catch common keys; expand when you see real keys in /sgo/events/raw
+    return (
+        "player" in m or
+        m in {
+            "player_pass_tds","player_passing_tds",
+            "player_passing_yards","player_pass_yards",
+            "player_receptions","player_rec",
+            "player_receiving_yards","player_rec_yards",
+            "player_rushing_yards","player_rush_yards",
+            "player_rush_attempts","player_attempts",
+            "player_anytime_td","player_anytime_touchdown"
+        }
+    )
+
+def norm_american(price) -> int | None:
+    # tries dict formats {american: "-115", decimal: 1.87} or plain str/int
+    if price is None:
+        return None
+    if isinstance(price, dict):
+        if "american" in price:
             try:
-                r = requests.get(url, headers=headers, params=params, timeout=20)
-                if r.status_code == 200:
-                    data = r.json()
-                    return {
-                        "ok": True,
-                        "used_url": url,
-                        "used_params": params,
-                        "count_hint": (
-                            len(data)
-                            if isinstance(data, list)
-                            else len(data.get("data", []))
-                            if isinstance(data, dict)
-                            else 0
-                        ),
-                        "sample": (
-                            data[:2]
-                            if isinstance(data, list)
-                            else data.get("data", data)
-                        ),
-                    }
-                else:
-                    errors.append({
-                        "url": url,
-                        "params": params,
-                        "status": r.status_code,
-                        "body": r.text[:200]
-                    })
-            except Exception as e:
-                errors.append({"url": url, "params": params, "error": str(e)})
+                return int(str(price["american"]))
+            except Exception:
+                return None
+        if "decimal" in price:
+            dec = float(price["decimal"])
+            # approx convert to american
+            return int(round((dec - 1) * 100)) if dec >= 2 else int(round(-100 / (dec - 1)))
+    try:
+        return int(str(price))
+    except Exception:
+        return None
 
-    raise HTTPException(status_code=502, detail={
-        "message": "Could not locate the correct SGO endpoint for player props.",
-        "hint": "Check SGO API docs for the correct path/param names.",
-        "attempts": errors[:8]
-    })
+@app.get("/nfl/props")
+def nfl_props(
+    date: str | None = Query(None),
+    books: str = Query("draftkings,fanduel"),
+    league: str = Query("nfl")
+):
+    # 1) fetch events with odds included
+    raw = sgo_events_raw(date=date, league=league, bookmakers=books)
+
+    # 2) normalize event list
+    events = []
+    if isinstance(raw, list):
+        events = raw
+    elif isinstance(raw, dict):
+        # common wrappers: data / results / events
+        events = raw.get("data") or raw.get("results") or raw.get("events") or []
+        if not isinstance(events, list):
+            events = []
+
+    books_list = [b.strip() for b in books.split(",") if b.strip()]
+    props_out = []
+
+    # 3) walk: event -> bookmakers -> markets -> outcomes
+    for ev in events:
+        game_id = ev.get("id") or ev.get("eventId") or ev.get("uid") or ""
+        home = ev.get("home_team") or ev.get("homeTeam") or ""
+        away = ev.get("away_team") or ev.get("awayTeam") or ""
+        game_label = f"{away}@{home}" if home or away else str(game_id)
+
+        for bm in ev.get("bookmakers", []) or ev.get("books", []) or []:
+            book_key = bm.get("key") or bm.get("bookmaker") or bm.get("name") or ""
+            if book_key and book_key not in books_list:
+                continue
+
+            markets = bm.get("markets") or bm.get("odds") or []
+            for mk in markets:
+                mkey = mk.get("key") or mk.get("market") or mk.get("name") or ""
+                if not is_player_prop_market(mkey):
+                    continue
+
+                for o in mk.get("outcomes", []) or mk.get("selections", []) or []:
+                    player = (
+                        o.get("description") or o.get("name") or
+                        o.get("participant") or o.get("player") or "Unknown Player"
+                    )
+                    line = o.get("point") or o.get("total") or o.get("line") or o.get("handicap")
+                    try:
+                        line = float(line) if line is not None else None
+                    except Exception:
+                        line = None
+                    american = norm_american(o.get("price") or o.get("odds"))
+
+                    # direction (Over/Under) if provided
+                    direction = (o.get("side") or o.get("label") or o.get("type") or "").title()
+                    if direction not in ("Over", "Under"):
+                        # many APIs encode O/U in outcome name, keep raw
+                        direction = None
+
+                    if american is None:
+                        continue
+
+                    props_out.append({
+                        "player": player,
+                        "market": mkey,
+                        "line": line,
+                        "direction": direction,
+                        "odds": american,
+                        "book": book_key,
+                        "game": game_label
+                    })
+
+    return {
+        "slate_date": date,
+        "provider": "SGO",
+        "books_used": books_list,
+        "count": len(props_out),
+        "props": props_out[:200],  # cap for readability
+        "timestamp": datetime.utcnow().isoformat()
+    }
