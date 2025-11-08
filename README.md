@@ -25,7 +25,8 @@
 ParlayCooker automates the construction of high-EV NFL player prop parlays.  
 It combines **real-time data** from DraftKings with **GPT-5 probabilistic modeling** to find the best-value parlays.
 
-![ParlayCooker Demo](docs/demo_parlay.png)
+<img width="1822" height="1109" alt="image" src="https://github.com/user-attachments/assets/1c3deab0-c4fd-4f80-bd6e-915c27bf3b80" />
+
 
 🧠 The GPT layer analyzes live props, computes expected value per leg, adjusts for correlation, and outputs a clean **Bet Slip Summary** ready for wagering.
 
