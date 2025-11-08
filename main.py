@@ -1,203 +1,184 @@
 from fastapi import FastAPI, HTTPException, Query
-import os, requests
-from datetime import datetime
-from dotenv import load_dotenv
-
-# Load local .env for dev; on Render env vars are injected automatically
-load_dotenv()
+import os, time, requests
+from datetime import datetime, timezone
 
 app = FastAPI()
 
-SGO_API_KEY = os.getenv("SGO_API_KEY")
-BASE_URL = os.getenv("SGO_BASE_URL", "https://api.sportsgameodds.com").rstrip("/")
+# -----------------------------
+# Config
+# -----------------------------
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")  # <-- set this on Render (or in .env locally)
+BASE = "https://api.the-odds-api.com"
+SPORT = "americanfootball_nfl"
+
+# simple in-memory cache (per instance)
+_cache = {
+    "events": {"ts": 0.0, "data": []},  # list of events from /odds
+    "props": {}                         # key: f"{event_id}|{books}|{markets}" -> {ts, data}
+}
+TTL_EVENTS = int(os.getenv("TTL_EVENTS", "60"))   # seconds
+TTL_PROPS  = int(os.getenv("TTL_PROPS", "60"))    # seconds
 
 
-def sgo_headers():
-    if not SGO_API_KEY:
-        raise HTTPException(500, "Missing SGO_API_KEY")
-    # SportsGameOdds uses x-api-key (not Bearer)
-    return {"x-api-key": SGO_API_KEY}
+# -----------------------------
+# Helpers
+# -----------------------------
+def _get(path: str, params: dict) -> dict:
+    """GET wrapper that adds apiKey and raises HTTPException on non-200."""
+    if not ODDS_API_KEY:
+        raise HTTPException(500, detail="Missing ODDS_API_KEY")
+    r = requests.get(f"{BASE}{path}", params={"apiKey": ODDS_API_KEY, **params}, timeout=25)
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, detail=r.text)
+    return r.json()
+
+def _now() -> float:
+    return time.time()
+
+def _normalize_props(event_json: dict, event_label: str) -> list[dict]:
+    """Flatten bookmakers -> markets -> outcomes into a simple list."""
+    out = []
+    eid = event_json.get("id") or ""
+    for bm in event_json.get("bookmakers", []) or []:
+        if (bm.get("key") or "").lower() != "draftkings":
+            continue
+        for mk in bm.get("markets", []) or []:
+            mkey = (mk.get("key") or "").lower()
+            if not mkey.startswith("player_"):
+                continue
+            for o in mk.get("outcomes", []) or []:
+                player = o.get("description") or o.get("name") or "Unknown Player"
+                line = o.get("point") or o.get("line") or o.get("total")
+                try:
+                    line = float(line) if line is not None else None
+                except Exception:
+                    line = None
+                direction = (o.get("name") or o.get("side") or "").title()
+                if direction not in ("Over", "Under"):
+                    direction = None
+                price = o.get("price")
+                try:
+                    price = int(str(price))
+                except Exception:
+                    continue
+
+                out.append({
+                    "event_id": eid,
+                    "game": event_label,
+                    "book": "draftkings",
+                    "market": mkey,
+                    "player": player,
+                    "line": line,
+                    "direction": direction,
+                    "odds": price,
+                })
+    return out
 
 
+# -----------------------------
+# Health
+# -----------------------------
 @app.get("/health")
-def health_get():
-    return {"ok": True, "provider": "SportsGameOdds", "time": datetime.utcnow().isoformat()}
+def health():
+    return {"ok": True, "provider": "TheOddsAPI", "time": datetime.now(timezone.utc).isoformat()}
 
 @app.head("/health")
 def health_head():
-    # For pingers that only send HEAD
+    # lets UptimeRobot/Render health checks use HEAD
     return {}
 
 
-# ---------- 1) RAW: show SGO events payload exactly as returned ----------
-@app.get("/sgo/events/raw")
-def sgo_events_raw(
-    date: str | None = Query(None, description="YYYY-MM-DD (if supported)"),
-    league: str = Query("NFL", description="SGO leagueID (e.g., NFL)"),
-    bookmakers: str = Query("draftkings,fanduel"),
-):
+# -----------------------------
+# Events (IDs for current/next slate)
+# -----------------------------
+@app.get("/nfl/events")
+def nfl_events(bookmakers: str = "draftkings", refresh: bool = False):
     """
-    Pure proxy to SGO 'events' endpoint.
-    Your SGO tier requires 'leagueID' or 'eventID'; we send 'leagueID'.
+    Returns upcoming/current NFL events (uses a cheap market to discover valid event IDs).
+    Use these IDs to fetch per-event player props.
     """
-    url_candidates = [
-        f"{BASE_URL}/v2/events",
-        f"{BASE_URL}/v1/events",
-        f"{BASE_URL}/events",
-    ]
-    params = {
-        "leagueID": league,           # <— KEY: SGO needs leagueID at your tier
-        "bookmakers": bookmakers,     # some APIs use 'books'; SGO shows 'bookmakers'
-        "oddsAvailable": "true",
-        "includeOdds": "true",
-        "includeAltLines": "true",
-    }
-    if date:
-        params["date"] = date
+    # serve cache unless refresh requested
+    if not refresh and (_now() - _cache["events"]["ts"] < TTL_EVENTS) and _cache["events"]["data"]:
+        data = _cache["events"]["data"]
+    else:
+        data = _get(f"/v4/sports/{SPORT}/odds", {
+            "regions": "us",
+            "bookmakers": bookmakers,
+            "markets": "h2h",        # cheap market to list events
+            "oddsFormat": "american"
+        })
+        _cache["events"] = {"ts": _now(), "data": data}
 
-    headers = sgo_headers()
-    errors = []
-    for url in url_candidates:
-        r = requests.get(url, headers=headers, params=params, timeout=25)
-        if r.status_code == 200:
-            return r.json()
-        errors.append({"url": url, "status": r.status_code, "body": r.text[:300]})
-
-    raise HTTPException(
-        502,
-        detail={"message": "SGO events endpoint not found", "attempts": errors},
-    )
+    events_min = []
+    for ev in data:
+        ev_id = ev.get("id")
+        home = ev.get("home_team") or ""
+        away = ev.get("away_team") or ""
+        events_min.append({"id": ev_id, "matchup": f"{away} @ {home}"})
+    return {"count": len(events_min), "events": events_min}
 
 
-# ---------- 2) NORMALIZED: extract player props from events ----------
-def is_player_prop_market(mkey: str) -> bool:
-    if not mkey:
-        return False
-    m = mkey.lower()
-    # Catch common player prop market keys; we’ll refine once we see your raw JSON
-    return (
-        "player" in m
-        or m
-        in {
-            "player_pass_tds",
-            "player_passing_tds",
-            "player_passing_yards",
-            "player_pass_yards",
-            "player_receptions",
-            "player_rec",
-            "player_receiving_yards",
-            "player_rec_yards",
-            "player_rushing_yards",
-            "player_rush_yards",
-            "player_rush_attempts",
-            "player_attempts",
-            "player_anytime_td",
-            "player_anytime_touchdown",
-        }
-    )
-
-
-def norm_american(price) -> int | None:
-    # Accept dict formats {american: "-115", decimal: 1.87} or plain str/int
-    if price is None:
-        return None
-    if isinstance(price, dict):
-        if "american" in price:
-            try:
-                return int(str(price["american"]))
-            except Exception:
-                return None
-        if "decimal" in price:
-            dec = float(price["decimal"])
-            # rough convert to American
-            return int(round((dec - 1) * 100)) if dec >= 2 else int(round(-100 / (dec - 1)))
-    try:
-        return int(str(price))
-    except Exception:
-        return None
-
-
+# -----------------------------
+# Player props (DK-only, aggregated)
+# -----------------------------
 @app.get("/nfl/props")
-def nfl_props(
-    date: str | None = Query(None),
-    books: str = Query("draftkings,fanduel"),
-    league: str = Query("NFL"),  # SGO leagueID
+def nfl_props_dk(
+    markets: str = Query(
+        "player_pass_tds,player_pass_yds,player_receptions,player_reception_yds,player_rush_yds,player_anytime_td"
+    ),
+    limit_events: int = Query(10, ge=1, le=32),
+    refresh: bool = Query(False),
 ):
-    # 1) fetch events (via the raw helper)
-    raw = sgo_events_raw(date=date, league=league, bookmakers=books)
+    """
+    Aggregates DraftKings player props for the first N events.
+    - markets: comma list of player_*** markets
+    - limit_events: how many events to fetch
+    - refresh: if true, bypasses caches (use sparingly)
+    """
+    # 1) get event list (cached)
+    if not refresh and (_now() - _cache["events"]["ts"] < TTL_EVENTS) and _cache["events"]["data"]:
+        events = _cache["events"]["data"][:limit_events]
+    else:
+        events = _get(f"/v4/sports/{SPORT}/odds", {
+            "regions": "us",
+            "bookmakers": "draftkings",
+            "markets": "h2h",
+            "oddsFormat": "american"
+        })[:limit_events]
+        _cache["events"] = {"ts": _now(), "data": events}
 
-    # 2) normalize event list
-    events = []
-    if isinstance(raw, list):
-        events = raw
-    elif isinstance(raw, dict):
-        # common wrappers: data / results / events
-        events = raw.get("data") or raw.get("results") or raw.get("events") or []
-        if not isinstance(events, list):
-            events = []
-
-    books_list = [b.strip() for b in books.split(",") if b.strip()]
-    props_out = []
-
-    # 3) walk: event -> bookmakers -> markets -> outcomes
+    # 2) for each event, fetch props (cached per event)
+    all_props = []
+    mks = ",".join([m.strip() for m in markets.split(",") if m.strip()])
     for ev in events:
-        game_id = ev.get("id") or ev.get("eventId") or ev.get("uid") or ""
-        home = ev.get("home_team") or ev.get("homeTeam") or ""
-        away = ev.get("away_team") or ev.get("awayTeam") or ""
-        game_label = f"{away}@{home}" if home or away else str(game_id)
+        eid = ev.get("id")
+        if not eid:
+            continue
+        key = f"{eid}|draftkings|{mks}"
+        use_cache = (not refresh) and (key in _cache["props"]) and (_now() - _cache["props"][key]["ts"] < TTL_PROPS)
 
-        for bm in ev.get("bookmakers", []) or ev.get("books", []) or []:
-            book_key = bm.get("key") or bm.get("bookmaker") or bm.get("name") or ""
-            if book_key and book_key not in books_list:
-                continue
+        if use_cache:
+            ev_props = _cache["props"][key]["data"]
+        else:
+            ev_props = _get(f"/v4/sports/{SPORT}/events/{eid}/odds", {
+                "regions": "us",
+                "bookmakers": "draftkings",
+                "markets": mks,
+                "oddsFormat": "american"
+            })
+            _cache["props"][key] = {"ts": _now(), "data": ev_props}
 
-            markets = bm.get("markets") or bm.get("odds") or []
-            for mk in markets:
-                mkey = mk.get("key") or mk.get("market") or mk.get("name") or ""
-                if not is_player_prop_market(mkey):
-                    continue
-
-                for o in mk.get("outcomes", []) or mk.get("selections", []) or []:
-                    player = (
-                        o.get("description")
-                        or o.get("name")
-                        or o.get("participant")
-                        or o.get("player")
-                        or "Unknown Player"
-                    )
-                    line = o.get("point") or o.get("total") or o.get("line") or o.get("handicap")
-                    try:
-                        line = float(line) if line is not None else None
-                    except Exception:
-                        line = None
-
-                    american = norm_american(o.get("price") or o.get("odds"))
-
-                    # direction (Over/Under) if provided
-                    direction = (o.get("side") or o.get("label") or o.get("type") or "").title()
-                    if direction not in ("Over", "Under"):
-                        direction = None
-
-                    if american is None:
-                        continue
-
-                    props_out.append(
-                        {
-                            "player": player,
-                            "market": mkey,
-                            "line": line,
-                            "direction": direction,
-                            "odds": american,
-                            "book": book_key,
-                            "game": game_label,
-                        }
-                    )
+        home = ev.get("home_team") or ""
+        away = ev.get("away_team") or ""
+        label = f"{away} @ {home}" if home and away else (ev.get("id") or "")
+        all_props.extend(_normalize_props(ev_props, label))
 
     return {
-        "slate_date": date,
-        "provider": "SGO",
-        "books_used": books_list,
-        "count": len(props_out),
-        "props": props_out[:200],  # cap for readability
-        "timestamp": datetime.utcnow().isoformat(),
+        "provider": "TheOddsAPI",
+        "book": "draftkings",
+        "event_count": len(events),
+        "markets_requested": mks.split(","),
+        "count": len(all_props),
+        "props": all_props[:500],  # cap for response size
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
